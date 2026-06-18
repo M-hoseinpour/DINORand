@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 @torch.no_grad()
-def topk_attended_positions_batch(dinov2, normalize_fn,  x_batch, k):
+def topk_attended_positions_batch(dinov2, normalize_fn,  x_batch, k, min_dist=2):
     B = x_batch.shape[0]
 
     holder = []
@@ -30,14 +30,14 @@ def topk_attended_positions_batch(dinov2, normalize_fn,  x_batch, k):
 
     indices = []
     for b in range(B):
-        scores   = attn_cls[b].clone()
+        scores = attn_cls[b].clone()
         selected = []
         for _ in range(k):
             idx = scores.argmax().item()
             selected.append(idx)
             row, col = idx // 16, idx % 16
-            for r in range(max(0, row - 2), min(16, row + 3)):
-                for c in range(max(0, col - 2), min(16, col + 3)):
+            for r in range(max(0, row - min_dist), min(16, row + min_dist + 1)):
+                for c in range(max(0, col - min_dist), min(16, col + min_dist + 1)):
                     scores[r * 16 + c] = -1.0
         indices.append(selected)
     return indices
@@ -61,7 +61,7 @@ def extract_crops_batch(x, indices, crop_size):
     return torch.cat(crops, dim=0)
 
 class CropRSClassifier(nn.Module):
-    def __init__(self, dino, normalizer, prototypes, sigma, m_per_crop, k_crops, crop_size):
+    def __init__(self, dino, normalizer, prototypes, sigma, m_per_crop, k_crops, crop_size, min_patch_dist=2):
         super().__init__()
         self.dino = dino
         self.normalizer = normalizer
@@ -70,6 +70,7 @@ class CropRSClassifier(nn.Module):
         self.m_per_crop = m_per_crop
         self.k_crops    = k_crops
         self.crop_size  = crop_size
+        self.min_patch_dist = min_patch_dist
 
     def classify_logits(self, x):
         feats = self.dino(self.normalizer(x))
@@ -79,7 +80,7 @@ class CropRSClassifier(nn.Module):
     def forward(self, x):
         B = x.shape[0]
         with torch.no_grad():
-            indices = topk_attended_positions_batch(self.dino, self.normalizer, x.detach(), self.k_crops)
+            indices = topk_attended_positions_batch(self.dino, self.normalizer, x.detach(), self.k_crops, self.min_patch_dist)
 
         crops = extract_crops_batch(x, indices, self.crop_size)
         agg = torch.zeros(B * self.k_crops, self.prototypes.shape[0], device=x.device)

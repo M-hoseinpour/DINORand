@@ -1,4 +1,3 @@
-# cli.py
 import os
 import argparse
 import torch
@@ -26,6 +25,7 @@ p.add_argument("--eot-iter", type=int, default=20)
 p.add_argument("--n-samples", type=int, default=100)
 p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
 p.add_argument('--end-idx',   type=int, default=None, help='End sample index (exclusive)')
+p.add_argument('--min-patch-dist', type=int, default=2)
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -65,7 +65,8 @@ if __name__ == "__main__":
                                 prototypes=prototypes,
                                 sigma=args.sigma,
                                 k_crops=args.k_crops,
-                                m_per_crop=args.noise_steps_per_crop_sample
+                                m_per_crop=args.noise_steps_per_crop_sample,
+                                min_patch_dist=args.min_patch_dist
                                 ).to(device).eval()
 
     val_loader = imagenet_val_loader(args.imagenet_val, batch_size=args.batch_size)
@@ -121,7 +122,7 @@ if __name__ == "__main__":
         x_chunk = x_test[start:chunk_end]
         y_chunk = y_test[start:chunk_end]
         x_adv_chunk, y_adv_chunk = adversary.run_standard_evaluation(x_chunk, y_chunk, bs=len(x_chunk), return_labels=True)
-        
+
         torch.save({'y_adv': y_adv_chunk.cpu(), 'labels': y_chunk.cpu()}, ckpt_path)
 
         all_y_adv.append(y_adv_chunk.cpu())
