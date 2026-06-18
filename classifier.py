@@ -1,6 +1,13 @@
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
+
+_root = Path(__file__).parent
+
+sys.path.insert(0, str(_root / 'guided-diffusion'))
+from guided_diffusion.script_util import (create_model_and_diffusion, model_and_diffusion_defaults)
 
 @torch.no_grad()
 def topk_attended_positions_batch(dinov2, normalize_fn,  x_batch, k, min_dist=2):
@@ -89,6 +96,117 @@ class CropRSClassifier(nn.Module):
             noise = torch.randn_like(crops) * self.sigma
             noisy = (crops + noise).clamp(0, 1)
             agg   = agg + self.classify_logits(noisy)
+
+        agg = agg / self.m_per_crop
+        agg = agg.view(B, self.k_crops, -1).mean(dim=1)
+        return agg
+
+
+def load_pixel_ddpm(ckpt_path, device):
+    """Load OpenAI guided-diffusion 256x256 unconditional ImageNet model."""
+    defaults = model_and_diffusion_defaults()
+    defaults.update(dict(
+        image_size=256, num_channels=256, num_res_blocks=2,
+        attention_resolutions='32,16,8', class_cond=False,
+        diffusion_steps=1000, learn_sigma=True,
+        noise_schedule='linear', num_heads=4,
+        num_head_channels=64, resblock_updown=True,
+        use_fp16=False, use_scale_shift_norm=True,
+    ))
+    model, diffusion = create_model_and_diffusion(**defaults)
+    model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+    return model.to(device).eval(), diffusion
+
+
+class DiffusionRSClassifier(nn.Module):
+    """
+    For each crop:
+      1. resize to DDPM size (256)
+      2. forward noise to timestep t (small, e.g. t=50)
+      3. one DDPM denoising step (back to t-1)
+      4. resize back to 224
+      5. add Gaussian noise sigma * eps (for RS)
+      6. DINOv2 → classify
+      7. repeat M times, average logits
+    """
+
+    def __init__(self, dino, normalizer, prototypes, sigma, m_per_crop,
+                 k_crops, crop_size, min_patch_dist,
+                 ddpm_model, diffusion, ddpm_timestep=50):
+        super().__init__()
+        self.dino           = dino
+        self.normalizer     = normalizer
+        self.prototypes     = prototypes
+        self.sigma          = sigma
+        self.m_per_crop     = m_per_crop
+        self.k_crops        = k_crops
+        self.crop_size      = crop_size
+        self.min_patch_dist = min_patch_dist
+        self.ddpm           = ddpm_model
+        self.diffusion      = diffusion
+        self.ddpm_timestep  = ddpm_timestep
+
+    def classify_logits(self, x):
+        feats = self.dino(self.normalizer(x))
+        feats = F.normalize(feats, dim=-1)
+        return feats @ self.prototypes.T * 100
+
+    def one_step_denoise(self, x):
+        """
+        Add noise to timestep t, then take one DDPM reverse step.
+        x: (B, 3, 224, 224) in [0,1]
+        Returns: (B, 3, 224, 224) in [0,1]
+        """
+        B = x.shape[0]
+        device = x.device
+
+        # resize to DDPM training size 256
+        x256 = F.interpolate(x, (256, 256), mode='bilinear', align_corners=False)
+        # [0,1] → [-1,1] (DDPM convention)
+        x_ddpm = (x256 - 0.5) * 2.0
+
+        # forward noise to timestep t
+        t   = torch.tensor([self.ddpm_timestep] * B, device=device).long()
+        eps = torch.randn_like(x_ddpm)
+        x_t = self.diffusion.q_sample(x_ddpm, t, noise=eps)
+
+        # one reverse step: t → t-1
+        out = self.diffusion.p_mean_variance(self.ddpm, x_t, t,
+                                              clip_denoised=True)
+        # use the mean (deterministic part) as the denoised output
+        x_clean_ddpm = out['mean']
+
+        # [-1,1] → [0,1]
+        x_clean = (x_clean_ddpm + 1.0) / 2.0
+        x_clean = x_clean.clamp(0, 1)
+
+        # resize back to 224
+        x_clean = F.interpolate(x_clean, (224, 224),
+                                mode='bicubic', align_corners=False)
+        return x_clean
+
+    def forward(self, x):
+        B = x.shape[0]
+        with torch.no_grad():
+            indices = topk_attended_positions_batch(
+                self.dino, self.normalizer, x.detach(),
+                self.k_crops, self.min_patch_dist,
+            )
+
+        crops = extract_crops_batch(x, indices, self.crop_size)
+        # crops: (B*k, 3, 224, 224)
+
+        agg = torch.zeros(B * self.k_crops, self.prototypes.shape[0],
+                          device=x.device)
+
+        for _ in range(self.m_per_crop):
+            # ── one DDPM step ──
+            denoised = self.one_step_denoise(crops)
+            # ── then RS Gaussian noise ──
+            noise   = torch.randn_like(denoised) * self.sigma
+            noisy   = (denoised + noise).clamp(0, 1)
+            # ── classify ──
+            agg     = agg + self.classify_logits(noisy)
 
         agg = agg / self.m_per_crop
         agg = agg.view(B, self.k_crops, -1).mean(dim=1)

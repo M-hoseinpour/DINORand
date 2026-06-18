@@ -8,6 +8,7 @@ from classifier import CropRSClassifier
 from data import imagenet_val_loader
 from utils import seed_eveything
 from autoattack import AutoAttack
+from typing import cast
 
 p = argparse.ArgumentParser()
 
@@ -26,6 +27,9 @@ p.add_argument("--n-samples", type=int, default=100)
 p.add_argument('--start-idx', type=int, default=0,    help='Start sample index')
 p.add_argument('--end-idx',   type=int, default=None, help='End sample index (exclusive)')
 p.add_argument('--min-patch-dist', type=int, default=2)
+p.add_argument('--ddpm-path', type=str, default=None)
+p.add_argument('--ddpm-timestep', type=int, default=50)
+p.add_argument('--use-ddpm', action='store_true')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -52,22 +56,37 @@ if __name__ == "__main__":
     start_idx = args.start_idx
     end_idx   = args.end_idx if args.end_idx is not None else n_eval
 
-    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+    dinov2 = cast(nn.Module, torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14'))
     dinov2 = dinov2.to(device).eval()
     for param in dinov2.parameters():
         param.requires_grad = False
 
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std =[0.229, 0.224, 0.225])
 
-    classifier = CropRSClassifier(dinov2,
-                                normalizer=normalizer,
-                                crop_size=args.crop_size,
-                                prototypes=prototypes,
-                                sigma=args.sigma,
-                                k_crops=args.k_crops,
-                                m_per_crop=args.noise_steps_per_crop_sample,
-                                min_patch_dist=args.min_patch_dist
-                                ).to(device).eval()
+    if args.use_ddpm:
+        from classifier import DiffusionRSClassifier, load_pixel_ddpm
+        assert args.ddpm_path, 'provide --ddpm-path when --use-ddpm'
+
+        print(f'Loading DDPM from {args.ddpm_path}')
+        ddpm_model, diffusion = load_pixel_ddpm(args.ddpm_path, device)
+        for param in ddpm_model.parameters():
+            param.requires_grad = False
+
+        classifier = DiffusionRSClassifier(
+            dino=dinov2, normalizer=normalizer, prototypes=prototypes,
+            sigma=args.sigma, m_per_crop=args.noise_steps_per_crop_sample,
+            k_crops=args.k_crops, crop_size=args.crop_size,
+            min_patch_dist=args.min_patch_dist,
+            ddpm_model=ddpm_model, diffusion=diffusion,
+            ddpm_timestep=args.ddpm_timestep,
+        ).to(device).eval()
+    else:
+        classifier = CropRSClassifier(
+            dino=dinov2, normalizer=normalizer, prototypes=prototypes,
+            sigma=args.sigma, m_per_crop=args.noise_steps_per_crop_sample,
+            k_crops=args.k_crops, crop_size=args.crop_size,
+            min_patch_dist=args.min_patch_dist,
+        ).to(device).eval()
 
     val_loader = imagenet_val_loader(args.imagenet_val, batch_size=args.batch_size)
 
