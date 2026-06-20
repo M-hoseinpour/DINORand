@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
+from torch.utils.checkpoint import checkpoint
 
 _root = Path(__file__).parent
 
@@ -112,6 +113,7 @@ def load_pixel_ddpm(ckpt_path, device):
         noise_schedule='linear', num_heads=4,
         num_head_channels=64, resblock_updown=True,
         use_fp16=False, use_scale_shift_norm=True,
+        use_checkpoint=False,
     ))
     model, diffusion = create_model_and_diffusion(**defaults)
     model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
@@ -174,7 +176,7 @@ class DiffusionRSClassifier(nn.Module):
         out = self.diffusion.p_mean_variance(self.ddpm, x_t, t,
                                               clip_denoised=True)
         # use the mean (deterministic part) as the denoised output
-        x_clean_ddpm = out['mean']
+        x_clean_ddpm = out['pred_xstart']
 
         # [-1,1] → [0,1]
         x_clean = (x_clean_ddpm + 1.0) / 2.0
@@ -194,19 +196,18 @@ class DiffusionRSClassifier(nn.Module):
             )
 
         crops = extract_crops_batch(x, indices, self.crop_size)
-        # crops: (B*k, 3, 224, 224)
+
+        def one_iteration(crops_in):
+            denoised = self.one_step_denoise(crops_in)
+            noise    = torch.randn_like(denoised) * self.sigma
+            noisy    = (denoised + noise).clamp(0, 1)
+            return self.classify_logits(noisy)
 
         agg = torch.zeros(B * self.k_crops, self.prototypes.shape[0],
-                          device=x.device)
+                        device=x.device)
 
         for _ in range(self.m_per_crop):
-            # ── one DDPM step ──
-            denoised = self.one_step_denoise(crops)
-            # ── then RS Gaussian noise ──
-            noise   = torch.randn_like(denoised) * self.sigma
-            noisy   = (denoised + noise).clamp(0, 1)
-            # ── classify ──
-            agg     = agg + self.classify_logits(noisy)
+            agg = agg + checkpoint(one_iteration, crops, use_reentrant=False)
 
         agg = agg / self.m_per_crop
         agg = agg.view(B, self.k_crops, -1).mean(dim=1)

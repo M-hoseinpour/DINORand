@@ -69,8 +69,6 @@ if __name__ == "__main__":
 
         print(f'Loading DDPM from {args.ddpm_path}')
         ddpm_model, diffusion = load_pixel_ddpm(args.ddpm_path, device)
-        for param in ddpm_model.parameters():
-            param.requires_grad = False
 
         classifier = DiffusionRSClassifier(
             dino=dinov2, normalizer=normalizer, prototypes=prototypes,
