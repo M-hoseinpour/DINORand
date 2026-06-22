@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from classifier import CropRSClassifier
+from classifier import ALL_POSITION_TEXTS, CropRSClassifier
 from data import imagenet_val_loader
 from utils import seed_eveything
 from autoattack import AutoAttack
@@ -30,6 +30,11 @@ p.add_argument('--min-patch-dist', type=int, default=2)
 p.add_argument('--ddpm-path', type=str, default=None)
 p.add_argument('--ddpm-timestep', type=int, default=50)
 p.add_argument('--use-ddpm', action='store_true')
+
+p.add_argument('--use-text-coherence', action='store_true')
+p.add_argument('--text-selection', type=str, default='weighted', choices=['top1', 'top3', 'weighted'])
+p.add_argument('--text-top-k', type=int, default=3, help='K for top-K selection (when --text-selection=top3)')
+p.add_argument('--text-temperature', type=float, default=10.0, help='Softmax temperature for weighted selection')
 
 if __name__ == "__main__":
     args = p.parse_args()
@@ -63,20 +68,35 @@ if __name__ == "__main__":
 
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std =[0.229, 0.224, 0.225])
 
-    if args.use_ddpm:
-        from classifier import DiffusionRSClassifier, load_pixel_ddpm
-        assert args.ddpm_path, 'provide --ddpm-path when --use-ddpm'
-
-        print(f'Loading DDPM from {args.ddpm_path}')
-        ddpm_model, diffusion = load_pixel_ddpm(args.ddpm_path, device)
-
-        classifier = DiffusionRSClassifier(
-            dino=dinov2, normalizer=normalizer, prototypes=prototypes,
-            sigma=args.sigma, m_per_crop=args.noise_steps_per_crop_sample,
-            k_crops=args.k_crops, crop_size=args.crop_size,
+    if args.use_text_coherence:
+        from classifier import (TextCoherentCropRSClassifier, TextEmbeddingCache)
+    
+        print('Loading dino.txt model...')
+        dino_txt = cast(nn.Module, torch.hub.load(
+            'facebookresearch/dinov2',
+            'dinov2_vitl14_reg4_dinotxt_tet1280d20h24l'
+        ))
+        dino_txt = dino_txt.to(device).eval()
+        for param in dino_txt.parameters():
+            param.requires_grad = False
+    
+        text_cache = TextEmbeddingCache(dino_txt, device)
+        print(f'Cached {len(ALL_POSITION_TEXTS)} position descriptors')
+    
+        classifier = TextCoherentCropRSClassifier(
+            dino=dinov2,
+            normalizer=normalizer,
+            prototypes=prototypes,
+            sigma=args.sigma,
+            m_per_crop=args.noise_steps_per_crop_sample,
+            k_crops=args.k_crops,
+            crop_size=args.crop_size,
             min_patch_dist=args.min_patch_dist,
-            ddpm_model=ddpm_model, diffusion=diffusion,
-            ddpm_timestep=args.ddpm_timestep,
+            dino_txt=dino_txt,
+            text_cache=text_cache,
+            selection=args.text_selection,
+            top_k_select=args.text_top_k,
+            temperature=args.text_temperature,
         ).to(device).eval()
     else:
         classifier = CropRSClassifier(
